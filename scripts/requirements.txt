@@ -1,0 +1,9 @@
+pandas
+openpyxl
+google-cloud-bigquery
+google-cloud-storage
+db-dtypes
+pyarrow
+google-cloud-bigquery-storage
+streamlit>=1.50
+plotly

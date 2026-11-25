@@ -1,0 +1,8 @@
+# 배포(GitHub 비공개 저장소)에서 제외 — 민감하거나 큰 파일
+data/원본/
+data/apt_unit_area_*.csv
+output/~$*
+__pycache__/
+*.pyc
+*.json
+.streamlit/secrets.toml
