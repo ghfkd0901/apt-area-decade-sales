@@ -17,10 +17,15 @@ st.set_page_config(page_title="아파트 면적·준공연대별 판매량", lay
 DATA = Path(__file__).resolve().parents[1] / "data" / "unit_year.parquet"
 
 
-@st.cache_data(show_spinner="데이터 불러오는 중…")
+@st.cache_resource(show_spinner="데이터 불러오는 중…")  # 복사본 없이 1벌만 메모리에 유지 (무료 서버 1GB 대응)
 def load():
-    df = pd.read_parquet(DATA)
-    df["per_m2"] = df["m3"] / df["area_m2"]
+    import pyarrow.parquet as pq, pyarrow as pa, pyarrow.compute as pc
+    cols = ["y", "apartment_code", "apartment_name", "sigungu", "area_m2", "built_year", "built_source", "m3"]
+    t = pq.read_table(DATA, columns=cols + ["is_apt"])
+    t = t.filter(pc.field("is_apt")).drop(["is_apt"])          # 아파트만 (분석 기준) — 메모리 절약
+    df = t.to_pandas(self_destruct=True, split_blocks=True); del t
+    pa.default_memory_pool().release_unused()
+    df["per_m2"] = (df["m3"] / df["area_m2"]).astype("float32")
     return df
 
 
@@ -82,7 +87,7 @@ else:
     year = PY[1]
 NY = PY[1] - PY[0] + 1
 PL = f"{PY[0]}년" if NY == 1 else f"{PY[0]}~{PY[1]}년 평균"
-apt_only = sb.checkbox("아파트만 (연립·다세대 제외)", True)
+apt_only = True  # 데이터 자체를 아파트만으로 불러옴 (연립·다세대 제외)
 sgg_all = sorted(df_all["sigungu"].astype(str).unique())
 sgg = sb.multiselect("시군구", sgg_all, default=sgg_all)
 kapt_only = sb.checkbox("준공연도 K-apt 사용승인일인 단지만", False,
@@ -114,13 +119,13 @@ min_n = sb.number_input("표본 경고 기준 (세대수 미만은 흐리게)", 
 
 
 # ───────────────────────── 필터 & 파생 ─────────────────────────
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)  # 필터 결과도 복사 없이 캐시, 최근 1개만 유지
 def prep(apt_only, sgg, kapt_only, YE, YL, AE, AL, thr):
     d = df_all
-    if apt_only: d = d[d["is_apt"]]
-    d = d[d["sigungu"].astype(str).isin(sgg)]
+    if len(sgg) < df_all["sigungu"].nunique():
+        d = d[d["sigungu"].astype(str).isin(sgg)]
     if kapt_only: d = d[d["built_source"] == "K-apt 사용승인일"]
-    d = d.copy()
+    d = d.copy(deep=False)  # 기존 열은 공유, 새 구간 열만 추가
     d["준공구간"] = pd.cut(d["built_year"].astype("float"), YE, labels=YL, right=False)
     d["면적구간"] = pd.cut(d["area_m2"], AE, labels=AL, right=True)
     d["정상"] = d["per_m2"] >= thr
@@ -132,8 +137,11 @@ dy = d[d["y"].between(PY[0], PY[1])]
 
 
 def agg(frame, keys):
-    g = frame.assign(m3_n=frame["m3"].where(frame["정상"], 0), a_n=frame["area_m2"].where(frame["정상"], 0),
-                     u_n=frame["정상"].astype(int))
+    ok = frame["정상"].to_numpy()
+    g = frame[[k for k in keys if k in frame.columns]].copy() if keys != ["_k"] else pd.DataFrame(index=frame.index)
+    if keys == ["_k"]: g["_k"] = 1
+    g["m3"] = frame["m3"].to_numpy(); g["area_m2"] = frame["area_m2"].to_numpy()
+    g["m3_n"] = np.where(ok, g["m3"], 0); g["a_n"] = np.where(ok, g["area_m2"], 0); g["u_n"] = ok.astype(np.int8)
     r = g.groupby(keys, observed=True).agg(세대수_전체=("m3", "size"), 판매량_전체=("m3", "sum"), 면적_전체=("area_m2", "sum"),
                                            세대수=("u_n", "sum"), 판매량=("m3_n", "sum"), 면적=("a_n", "sum")).reset_index()
     if "y" not in keys:  # 여러 해가 섞여 있으면 연평균으로 (비율 지표는 그대로, 세대수·합계만 ÷ 연수)
@@ -148,6 +156,15 @@ def agg(frame, keys):
     return r
 
 
+def hist(x, nbins, title, xlab):
+    x = np.asarray(x, dtype="float64"); x = x[np.isfinite(x)]
+    cnt, edges = np.histogram(x, bins=nbins)
+    fig = go.Figure(go.Bar(x=(edges[:-1] + edges[1:]) / 2, y=cnt, width=np.diff(edges) * 0.95,
+                           hovertemplate="%{x:.2f}: %{y:,}세대<extra></extra>"))
+    fig.update_layout(title=title, xaxis_title=xlab, yaxis_title="세대수", bargap=0)
+    return fig
+
+
 METRICS = {"㎡당 판매량 (㎥/㎡)": "㎡당", "㎡당 (이상치 포함)": "㎡당(이상치포함)", "세대당 판매량 (㎥)": "세대당",
            "평균 전용면적 (㎡)": "평균면적", "세대수": "세대수", "이상치 비중": "이상치비중"}
 FMT = {"㎡당": ".2f", "㎡당(이상치포함)": ".2f", "세대당": ",.0f", "평균면적": ".1f", "세대수": ",.0f", "이상치비중": ".1%"}
@@ -160,7 +177,7 @@ tabs = st.tabs(["개요", "계산 따라가기", "면적 × 준공 히트맵", "
 
 # ───────────────────────── 1. 개요 ─────────────────────────
 with tabs[0]:
-    tot = agg(dy.assign(_k=1), ["_k"]).iloc[0]
+    tot = agg(dy, ["_k"]).iloc[0]
     c = st.columns(4)
     c[0].metric("분석 세대수 (이상치 제외)", f"{int(tot['세대수']):,}", f"전체 {int(tot['세대수_전체']):,}", delta_color="off")
     c[1].metric("세대당 연간 판매량", f"{tot['세대당']:,.0f} ㎥")
@@ -219,8 +236,8 @@ with tabs[1]:
         st.markdown("#### ③ 이상치 빼기")
         st.markdown(f"㎡당 **{thr:.1f}㎥ 미만** = 빈집·거의 미사용으로 보고 제외 → "
                     f"**{No:,}세대 제외** ({No / N:.1%}), **{Nn:,}세대**로 계산")
-        fig = px.histogram(cell[cell["per_m2"] <= cell["per_m2"].quantile(0.995)], x="per_m2", nbins=60,
-                           title="이 칸 세대들의 ㎡당 판매량 분포 — 빨간 선 왼쪽이 이상치")
+        fig = hist(cell["per_m2"][cell["per_m2"] <= cell["per_m2"].quantile(0.995)], 60,
+                   "이 칸 세대들의 ㎡당 판매량 분포 — 빨간 선 왼쪽이 이상치", "㎡당 연간 판매량")
         fig.add_vline(x=thr, line_dash="dash", line_color="red")
         fig.update_layout(height=280, bargap=0.02, margin=dict(t=40, b=10), xaxis_title="㎡당 연간 판매량")
         st.plotly_chart(fig, **W)
@@ -243,7 +260,7 @@ with tabs[1]:
             f"(제외했을 때보다 {Ma / Aa - M / A:+.2f}) — 빈집이 섞여 평균이 내려감\n"
             f"- 세대별 ㎡당을 그냥 평균내면: **{simple:.2f} ㎥/㎡** — 이 방식은 작은 집과 큰 집을 같은 무게로 쳐서 "
             f"작은 집 비중만큼 값이 달라짐. 그래서 **합계 ÷ 합계**(면적이 큰 집이 더 큰 무게)로 계산")
-        tot = agg(dy.assign(_k=1), ["_k"]).iloc[0]
+        tot = agg(dy, ["_k"]).iloc[0]
         st.markdown(f"- 같은 기간({PL}) 전체 평균 ㎡당은 **{tot['㎡당']:.2f}** → 이 칸은 전체보다 "
                     f"**{M / A / tot['㎡당'] - 1:+.0%}**")
 
@@ -261,7 +278,7 @@ def heat(frame, row, colkey, metric, title, by_row=False):
         span = float(np.nanmax(np.abs(ok.values))) if np.isfinite(ok.values).any() else 0.1
         zmin, zmax, cs = -span, span, "RdBu_r"
     elif diverging:  # 전체 평균 기준: 빨강 = 평균보다 높음, 파랑 = 낮음
-        mid = float(agg(frame.assign(_k=1), ["_k"]).iloc[0][metric])
+        mid = float(agg(frame, ["_k"]).iloc[0][metric])
         span = float(np.nanmax(np.abs(ok.values - mid))) if np.isfinite(ok.values).any() else 1.0
         zmin, zmax, cs = mid - span, mid + span, "RdBu_r"
     else:
@@ -378,26 +395,26 @@ with tabs[6]:
     st.subheader("2. 분포")
     l, r = st.columns(2)
     q = dy["m3"].quantile(0.995)
-    fig = px.histogram(dy[dy["m3"] <= q], x="m3", nbins=80, title="세대별 연간 판매량 (㎥, 상위 0.5% 잘라냄)")
+    fig = hist(dy["m3"][dy["m3"] <= q], 80, "세대별 연간 판매량 (㎥, 상위 0.5% 잘라냄)", "연간 판매량(㎥)")
     fig.update_layout(height=330, bargap=0.02); l.plotly_chart(fig, **W)
     q = dy["per_m2"].quantile(0.995)
-    fig = px.histogram(dy[dy["per_m2"] <= q], x="per_m2", nbins=80, title="세대별 ㎡당 연간 판매량 (㎥/㎡)")
+    fig = hist(dy["per_m2"][dy["per_m2"] <= q], 80, "세대별 ㎡당 연간 판매량 (㎥/㎡)", "㎡당 연간 판매량")
     fig.add_vline(x=thr, line_dash="dash", line_color="red", annotation_text=f"이상치 기준 {thr:.1f}")
     fig.update_layout(height=330, bargap=0.02); r.plotly_chart(fig, **W)
     l, r = st.columns(2)
-    fig = px.histogram(dy[dy["area_m2"] <= 200], x="area_m2", nbins=100, title="전용면적 분포 (㎡) — 59·84형에 몰림")
+    fig = hist(dy["area_m2"][dy["area_m2"] <= 200], 100, "전용면적 분포 (㎡) — 59·84형에 몰림", "전용면적(㎡)")
     for e in AE[1:-1]: fig.add_vline(x=e, line_dash="dot", line_color="gray")
     fig.update_layout(height=330, bargap=0.02); l.plotly_chart(fig, **W)
-    fig = px.histogram(dy, x=dy["built_year"].astype(float), nbins=60, color=dy["built_source"].astype(str),
-                       title="준공연도 분포 (세대 기준)")
+    by = dy.groupby([dy["built_year"].astype("float"), dy["built_source"].astype(str)], observed=True).size().rename("세대수").reset_index()
+    fig = px.bar(by, x="built_year", y="세대수", color="built_source", title="준공연도 분포 (세대 기준)")
     fig.update_layout(height=330, bargap=0.02, legend=dict(orientation="h", y=-0.25), xaxis_title="준공연도")
     r.plotly_chart(fig, **W)
 
     st.subheader("3. 준공구간별 ㎡당 판매량 분포 (박스플롯)")
-    smp = dy.sample(min(len(dy), 80_000), random_state=0)
+    smp = dy.sample(min(len(dy), 20_000), random_state=0)
     smp = smp[smp["per_m2"] <= smp["per_m2"].quantile(0.995)]
     fig = px.box(smp, x="준공구간", y="per_m2", points=False, category_orders={"준공구간": YL},
-                 title="상자 = 중간 50% 세대, 가운데 선 = 중앙값 (표본 8만 세대)")
+                 title="상자 = 중간 50% 세대, 가운데 선 = 중앙값 (표본 2만 세대)")
     fig.add_hline(y=thr, line_dash="dash", line_color="red", annotation_text="이상치 기준")
     fig.update_layout(height=420, yaxis_title="㎡당 연간 판매량"); st.plotly_chart(fig, **W)
 
